@@ -1,5 +1,34 @@
 #!/bin/bash
 
+# Check if reset flag is passed
+if [[ "$1" == "--reset" ]]; then
+  read -p "⚠️ Are you sure you want to reset the environment? This will delete all data. (Y/n) " -n 1 -r
+  echo
+  if [[ -z "$REPLY" || "$REPLY" =~ ^[Yy]$ ]]; then
+    echo "🔄 Starting reset process..."
+    ./reset.sh
+
+    read -p "⚠️ Reset completed. Do you want to proceed with the installation? (Y/n) " -n 1 -r
+    echo
+    if [[ -z "$REPLY" || "$REPLY" =~ ^[Yy]$ ]]; then
+      echo "❌ Installation cancelled after reset."
+      exit 1
+    fi
+  else
+    echo "❌ Reset cancelled."
+    exit 1
+  fi
+fi
+
+# Cleanup on exit
+cleanup() {
+  echo "🩹 Cleaning up..."
+  rm -f "$ZIP_FILE"
+  rm -rf "$TEMP_DIR"
+  # docker compose down --volumes --remove-orphans
+}
+trap cleanup EXIT
+
 # Let's start 🚀
 echo "🚀 Let's start building with WordPress!"
 
@@ -36,17 +65,19 @@ else
   exit 1
 fi
 
-# Check and copy the .env file if it doesn't exist 🗂️
+# Check and copy the .env file if it doesn't exist 💂️
 if [ -f .env ]; then
-  echo "ℹ️ .env file already exists. Skipping copy."
-else
-  if [ -f .env.example ]; then
+  read -p "⚠️ .env file already exists. Do you want to overwrite it? (y/N) " -n 1 -r
+  echo
+  if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     cp .env.example .env
-    echo "✅ .env file created from .env.example."
+    echo "✅ .env file overwritten with .env.example."
   else
-    echo "❌ Error: .env.example is missing. Please provide a .env file or an example file."
-    exit 1
+    echo "ℹ️ Using existing .env file."
   fi
+else
+  cp .env.example .env
+  echo "✅ .env file created from .env.example."
 fi
 
 # Load THEME_NAME from .env 🔍
@@ -64,80 +95,93 @@ echo "✅ Permissions set for ./_volumes."
 # Download and extract theme ZIP 📦
 ZIP_URL=$(grep -E "^THEME_PACKAGE_URL=" .env | cut -d '=' -f 2 | xargs)
 ZIP_FILE="theme.zip"
-TEMP_DIR="bathe-main"
+TEMP_DIR="temp_theme"
 
 echo "📥 Downloading theme from $ZIP_URL..."
-wget -O "$ZIP_FILE" "$ZIP_URL"
+if ! wget -O "$ZIP_FILE" "$ZIP_URL"; then
+  echo "❌ Error: Failed to download theme."
+  exit 1
+fi
 
-echo "📂 Extracting theme..."
-unzip -q "$ZIP_FILE" -d .
-if [ -d "$TEMP_DIR" ]; then
-  echo "✅ Theme extracted to temporary directory: $TEMP_DIR"
+echo "🗂 Extracting theme..."
+if unzip -q "$ZIP_FILE" -d "$TEMP_DIR"; then
+  echo "✅ Theme extracted successfully to $TEMP_DIR."
 else
   echo "❌ Error: Failed to extract theme."
-  rm "$ZIP_FILE"
   exit 1
 fi
 
-# Move all files (including hidden) from temporary directory to root
-echo "📂 Moving all theme files (including hidden files) to root directory..."
-find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -exec mv -f {} . \;
-rm -rf "$TEMP_DIR" "$ZIP_FILE"
-echo "✅ Theme files moved to root directory."
+EXTRACTED_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+if [ -d "$EXTRACTED_DIR" ]; then
+  echo "📂 Moving files from $EXTRACTED_DIR to the project root..."
+  find "$EXTRACTED_DIR" -mindepth 1 -maxdepth 1 -exec mv -f {} . \;
+else
+  echo "⚠️ No valid directory found in $TEMP_DIR. Assuming files are directly extracted."
+  find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -exec mv -f {} . \;
+fi
 
-# Start the containers 🛳️
+rm -rf "$TEMP_DIR" "$ZIP_FILE"
+
+# Start the containers 🚢
 docker compose build --no-cache --force-rm
 docker compose up -d
-echo "✅ Docker containers started successfully."
 
-# Configure Git safe.directory in Docker 🐳
-echo "📦 Configuring Git safe.directory in the container..."
-docker compose exec web bash -c "
-  git config --global --add safe.directory /var/www/html/wp-content/themes/$THEME_NAME
-"
-if [ $? -eq 0 ]; then
-  echo "✅ Git safe.directory configured successfully."
-else
-  echo "❌ Error: Failed to configure Git safe.directory."
-  exit 1
+echo "⏳ Waiting for database to be ready..."
+until docker compose exec db mysqladmin ping -h db --silent; do
+    echo "🛠️ Database not ready. Retrying..."
+    sleep 3
+done
+echo "✅ Database is ready!"
+
+# Clean database
+DB_NAME="${DB_MYSQL_DATABASE:-wordpress}"
+DB_USER="${DB_MYSQL_USER:-wordpress}"
+DB_PASS="${DB_MYSQL_PASSWORD:-wordpress}"
+DB_HOST="db:${DOCKER_DB_PORT:-3306}"
+docker compose exec db mysql -u${DB_USER} -p${DB_PASS} -e "DROP DATABASE IF EXISTS ${DB_NAME}; CREATE DATABASE ${DB_NAME};"
+
+echo "🗑️ Removing existing wp-config.php..."
+docker compose exec web bash -c "if [ -f /var/www/html/wp-config.php ]; then rm -f /var/www/html/wp-config.php; fi"
+
+# Create wp-config.php
+docker compose run --rm cli config create \
+    --dbname="$DB_NAME" \
+    --dbuser="$DB_USER" \
+    --dbpass="$DB_PASS" \
+    --dbhost="$DB_HOST" \
+    --skip-check --allow-root
+
+echo "⚙️ Installing WordPress..."
+SITE_URL="http://localhost:${DOCKER_WORDPRESS_PORT:-8000}"
+ADMIN_USER="${WP_ADMIN_USER:-admin}"
+ADMIN_PASSWORD="${WP_ADMIN_PASSWORD:-password}"
+ADMIN_EMAIL="${WP_ADMIN_EMAIL:-admin@example.com}"
+SITE_TITLE="${WP_SITE_TITLE:-My WordPress Site}"
+docker compose run --rm cli core install \
+    --url="$SITE_URL" \
+    --title="$SITE_TITLE" \
+    --admin_user="$ADMIN_USER" \
+    --admin_password="$ADMIN_PASSWORD" \
+    --admin_email="$ADMIN_EMAIL" \
+    --allow-root
+
+# Install and activate plugins
+if [ -z "${PLUGINS}" ]; then
+  PLUGINS=("wp-mail-smtp") # Default plugin
 fi
 
-# Run composer install in Docker 🐳
-echo "📦 Running composer install in the container..."
-docker compose exec web bash -c "
-  cd wp-content/themes/$THEME_NAME &&
-  composer install
-"
-if [ $? -eq 0 ]; then
-  echo "✅ Composer dependencies installed successfully."
-else
-  echo "❌ Error: Composer install failed."
-  exit 1
-fi
+PLUGINS=($(grep -E "^PLUGINS=" .env | cut -d '=' -f 2 | tr ',' ' '))
+for PLUGIN in "${PLUGINS[@]}"; do
+    docker compose run --rm cli plugin install "$PLUGIN" --activate --allow-root
+done
 
-# Run yarn install locally 🧶
-echo "🧶 Installing Yarn dependencies locally..."
-yarn install
-if [ $? -eq 0 ]; then
-  echo "✅ Yarn dependencies installed successfully."
-else
-  echo "❌ Error: Yarn install failed."
-  exit 1
-fi
+# Configure SMTP plugin
+SMTP_HOST="${SMTP_HOST:-mailpit}"
+SMTP_PORT="${SMTP_PORT:-1025}"
+SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL:-noreply@localhost}"
+SMTP_FROM_NAME="${SMTP_FROM_NAME:-WordPress}"
+docker compose run --rm cli option update wp_mail_smtp \
+    "{\"mailer\":\"smtp\",\"from_email\":\"$SMTP_FROM_EMAIL\",\"from_name\":\"$SMTP_FROM_NAME\",\"smtp\":{\"host\":\"$SMTP_HOST\",\"port\":$SMTP_PORT,\"encryption\":\"none\",\"auth\":false}}" \
+    --format=json --allow-root
 
-# Create lock file 🔒
-touch init.lock
-echo "🔒 Initialization lock file created."
-
-# Print completion message 🎉
-echo "🚀 Initialization completed! Happy coding with WordPress!"
-
-# Launch wordpress.sh after init
-echo "⚙️ Running WordPress setup script..."
-bash wordpress.sh
-if [ $? -eq 0 ]; then
-    echo "✅ WordPress setup completed successfully."
-else
-    echo "❌ Error: WordPress setup failed."
-    exit 1
-fi
+echo "🚀 WordPress setup completed!"
