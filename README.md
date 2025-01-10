@@ -1,7 +1,3 @@
-Grazie per le informazioni aggiuntive! Ecco una versione aggiornata della descrizione della repository in inglese, includendo i dettagli sui file principali:
-
----
-
 # WordPress Starter with Docker 🚀
 
 This repository provides a collection of Bash scripts and configuration files to quickly set up a development environment for WordPress themes using Docker. It automates the initialization of a WordPress instance, theme setup, and plugin configuration, making it easy to develop and test themes in a containerized setup.
